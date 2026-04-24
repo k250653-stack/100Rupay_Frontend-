@@ -2,14 +2,36 @@ import { useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useIssues } from '../context/IssuesContext'
 import { useAuth } from '../context/AuthContext'
-import { getCurrentPosition } from '../utils/helpers'
+import { getCurrentPosition, isMobile } from '../utils/helpers'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Camera, X, Check, MapPin, RotateCcw, Loader2 } from 'lucide-react'
+import { Camera, X, Check, MapPin, RotateCcw, Loader2, Smartphone, Images } from 'lucide-react'
 
 export default function CapturePage() {
   const { user } = useAuth()
   const { addCapture } = useIssues()
   const navigate = useNavigate()
+
+  // Desktop guard — camera capture is mobile-only
+  if (!isMobile()) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-4 px-6 text-center">
+        <div className="w-16 h-16 bg-surface2 rounded-full flex items-center justify-center border border-border2">
+          <Smartphone size={28} className="text-mint" />
+        </div>
+        <h3 className="font-semibold text-lg text-txt">Mobile-only feature</h3>
+        <p className="text-sm text-txt2 max-w-[280px]">
+          Camera capture is mobile-only. Open 100 Rupay on your phone to capture photos of issues in the field.
+        </p>
+        <button
+          onClick={() => navigate('/gallery')}
+          className="flex items-center gap-2 bg-lime text-bg font-mono text-[11px] font-semibold uppercase tracking-wider px-5 py-2.5 rounded-lg hover:brightness-110 transition"
+        >
+          <Images size={14} />
+          Go to My Photos
+        </button>
+      </div>
+    )
+  }
 
   const videoRef = useRef(null)
   const canvasRef = useRef(null)

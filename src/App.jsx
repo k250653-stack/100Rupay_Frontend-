@@ -16,7 +16,7 @@ export default function App() {
         <IssuesProvider>
           <div className="h-screen h-[100dvh] flex flex-col overflow-hidden">
             <TopBar />
-            <main className="flex-1 mt-[52px] mb-[64px] overflow-hidden">
+            <main className="flex-1 mt-[78px] mb-[64px] overflow-hidden">
               <Routes>
                 <Route path="/" element={<MapPage />} />
                 <Route path="/capture" element={<CapturePage />} />

@@ -1,8 +1,14 @@
-// Detect if user is on mobile device
+// Detect if user is on mobile device — require at least 2 of 3 signals to avoid
+// false positives on touchscreen laptops and false negatives on tablets.
 export function isMobile() {
-  if (typeof navigator === 'undefined') return false
-  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)
-    || (navigator.maxTouchPoints && navigator.maxTouchPoints > 2)
+  if (typeof navigator === 'undefined' || typeof window === 'undefined') return false
+  const uaMatch = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+    navigator.userAgent || ''
+  )
+  const touchCapable = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0)
+  const narrowViewport = window.innerWidth <= 900
+  const score = (uaMatch ? 1 : 0) + (touchCapable ? 1 : 0) + (narrowViewport ? 1 : 0)
+  return score >= 2
 }
 
 // Check if device has camera access

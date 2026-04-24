@@ -1,10 +1,67 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useIssues } from '../context/IssuesContext'
 import { useAuth } from '../context/AuthContext'
 import { CATEGORIES } from '../utils/helpers'
-import { motion, AnimatePresence } from 'framer-motion'
-import { MapPin, Sparkles, AlertTriangle, Eye, EyeOff, Loader2, Check, ChevronRight, Send } from 'lucide-react'
+import { motion, AnimatePresence, useAnimationControls } from 'framer-motion'
+import { MapPin, Sparkles, AlertTriangle, Eye, EyeOff, Loader2, Check, ChevronRight, Send, Undo2, Trash2, Circle, Route } from 'lucide-react'
+import { MapContainer, TileLayer, Marker, Polyline, useMap, useMapEvents } from 'react-leaflet'
+import L from 'leaflet'
+
+const KARACHI_CENTER = { lat: 24.8607, lng: 67.0099 }
+
+const pinIcon = L.divIcon({
+  className: 'custom-marker',
+  html: `<div style="display:flex;align-items:center;justify-content:center;">
+           <div style="width:16px;height:16px;border-radius:50%;background:#c8f560;border:3px solid #0d0f0e;box-shadow:0 0 0 2px #c8f560;"></div>
+         </div>`,
+  iconSize: [22, 22],
+  iconAnchor: [11, 11],
+})
+
+const waypointIcon = L.divIcon({
+  className: 'custom-marker',
+  html: `<div style="width:10px;height:10px;border-radius:50%;background:#60f5c0;border:2px solid #0d0f0e;"></div>`,
+  iconSize: [14, 14],
+  iconAnchor: [7, 7],
+})
+
+// Total line length in meters using Leaflet's geodesic distance
+function lineLengthMeters(coords) {
+  if (!coords || coords.length < 2) return 0
+  let total = 0
+  for (let i = 1; i < coords.length; i++) {
+    total += L.latLng(coords[i - 1]).distanceTo(L.latLng(coords[i]))
+  }
+  return total
+}
+
+// Collects map clicks as line waypoints
+function LineClickCollector({ onAdd }) {
+  useMapEvents({
+    click(e) {
+      onAdd([e.latlng.lat, e.latlng.lng])
+    },
+  })
+  return null
+}
+
+// Re-zooms the map when geometryType toggles between point and line modes.
+// Starts line-drawing zoomed in to street level (19), point mode at 17.
+function ModeViewController({ geometryType, captureLatLng }) {
+  const map = useMap()
+  const firstRenderRef = useRef(true)
+  useEffect(() => {
+    if (firstRenderRef.current) {
+      firstRenderRef.current = false
+      return
+    }
+    const targetZoom = geometryType === 'line' ? 19 : 17
+    const target = captureLatLng || map.getCenter()
+    map.setView(target, targetZoom, { animate: true })
+  }, [geometryType])
+  return null
+}
 
 export default function ReportPage() {
   const { user } = useAuth()
@@ -26,6 +83,169 @@ export default function ReportPage() {
   const [nearbyIssues, setNearbyIssues] = useState([])
   const [phase, setPhase] = useState('select') // select | form | nearby | success
   const [submitting, setSubmitting] = useState(false)
+
+  // Geometry state — geometryType is 'point' or 'line'
+  const [geometryType, setGeometryType] = useState('point')
+  const [pointLatLng, setPointLatLng] = useState(null)
+  const [waypoints, setWaypoints] = useState([])         // snapped-to-road clicks [[lat,lng], ...]
+  const [snappedPath, setSnappedPath] = useState([])     // road-following path from OSRM
+  const [routingLoading, setRoutingLoading] = useState(false)
+  const [routingError, setRoutingError] = useState(false)
+  const [rejectToast, setRejectToast] = useState(false)
+  const routeAbortRef = useRef(null)
+  const toastTimerRef = useRef(null)
+  const shakeControls = useAnimationControls()
+
+  // Initialize marker position when a capture is selected
+  useEffect(() => {
+    if (!selectedCapture) return
+    const hasValidGps =
+      typeof selectedCapture.lat === 'number' &&
+      typeof selectedCapture.lng === 'number' &&
+      (selectedCapture.lat !== 0 || selectedCapture.lng !== 0)
+    setPointLatLng(hasValidGps
+      ? { lat: selectedCapture.lat, lng: selectedCapture.lng }
+      : { ...KARACHI_CENTER })
+    setWaypoints([])
+    setSnappedPath([])
+    setRoutingError(false)
+    setRoutingLoading(false)
+    if (routeAbortRef.current) routeAbortRef.current.abort()
+    setGeometryType('point')
+  }, [selectedCapture?.id])
+
+  // Cancel any in-flight routing request + clear toast timer on unmount
+  useEffect(() => {
+    return () => {
+      if (routeAbortRef.current) routeAbortRef.current.abort()
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    }
+  }, [])
+
+  const mapCenter = pointLatLng
+    ? [pointLatLng.lat, pointLatLng.lng]
+    : [KARACHI_CENTER.lat, KARACHI_CENTER.lng]
+
+  // The capture's GPS (or Karachi fallback) — used to re-center on mode toggle
+  const captureLatLng =
+    selectedCapture &&
+    typeof selectedCapture.lat === 'number' &&
+    typeof selectedCapture.lng === 'number' &&
+    (selectedCapture.lat !== 0 || selectedCapture.lng !== 0)
+      ? [selectedCapture.lat, selectedCapture.lng]
+      : [KARACHI_CENTER.lat, KARACHI_CENTER.lng]
+
+  const triggerRejection = () => {
+    shakeControls.start({
+      x: [-6, 6, -4, 4, -2, 2, 0],
+      transition: { duration: 0.4, ease: 'easeInOut' },
+    })
+    setRejectToast(true)
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = setTimeout(() => setRejectToast(false), 2000)
+  }
+
+  // Validate and snap a raw map click to the nearest road via OSRM's nearest endpoint.
+  // Reject if further than 15m from any road; otherwise add the snapped position.
+  const handleMapClick = async ([lat, lng]) => {
+    try {
+      const url = `https://router.project-osrm.org/nearest/v1/driving/${lng},${lat}?number=1`
+      const res = await fetch(url)
+      if (!res.ok) throw new Error('nearest http ' + res.status)
+      const data = await res.json()
+      if (data.code !== 'Ok' || !data.waypoints || data.waypoints.length === 0) {
+        throw new Error('nearest no waypoint')
+      }
+      const wp = data.waypoints[0]
+      if (typeof wp.distance === 'number' && wp.distance > 15) {
+        triggerRejection()
+        return
+      }
+      const [snappedLng, snappedLat] = wp.location
+      addWaypoint([snappedLat, snappedLng])
+    } catch (err) {
+      // Nearest endpoint unreachable — accept raw click and let the route fetch
+      // handle fallback to straight lines if needed.
+      addWaypoint([lat, lng])
+    }
+  }
+
+  // Fetch road-snapped route from OSRM public server
+  const fetchSnappedRoute = async (pts) => {
+    if (!pts || pts.length < 2) {
+      setSnappedPath([])
+      setRoutingError(false)
+      setRoutingLoading(false)
+      return
+    }
+    if (routeAbortRef.current) routeAbortRef.current.abort()
+    const ctrl = new AbortController()
+    routeAbortRef.current = ctrl
+    setRoutingLoading(true)
+
+    try {
+      const coordsPart = pts.map(([lat, lng]) => `${lng},${lat}`).join(';')
+      const url = `https://router.project-osrm.org/route/v1/driving/${coordsPart}?overview=full&geometries=geojson`
+      const res = await fetch(url, { signal: ctrl.signal })
+      if (!res.ok) throw new Error('OSRM HTTP ' + res.status)
+      const data = await res.json()
+      if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+        throw new Error('No route')
+      }
+      const path = data.routes[0].geometry.coordinates.map(([lng, lat]) => [lat, lng])
+      if (routeAbortRef.current !== ctrl) return // superseded
+      setSnappedPath(path)
+      setRoutingError(false)
+    } catch (err) {
+      if (err.name === 'AbortError') return
+      if (routeAbortRef.current !== ctrl) return
+      setSnappedPath([])
+      setRoutingError(true)
+    } finally {
+      if (routeAbortRef.current === ctrl) setRoutingLoading(false)
+    }
+  }
+
+  const addWaypoint = (latlng) => {
+    const next = [...waypoints, latlng]
+    setWaypoints(next)
+    if (next.length >= 2) fetchSnappedRoute(next)
+  }
+
+  const undoLastWaypoint = () => {
+    const next = waypoints.slice(0, -1)
+    setWaypoints(next)
+    if (next.length >= 2) {
+      fetchSnappedRoute(next)
+    } else {
+      if (routeAbortRef.current) routeAbortRef.current.abort()
+      setSnappedPath([])
+      setRoutingError(false)
+      setRoutingLoading(false)
+    }
+  }
+
+  const clearWaypoints = () => {
+    if (routeAbortRef.current) routeAbortRef.current.abort()
+    setWaypoints([])
+    setSnappedPath([])
+    setRoutingError(false)
+    setRoutingLoading(false)
+  }
+
+  // Distance derived from snapped path when available, otherwise fallback to straight waypoints
+  const measurePath = snappedPath.length >= 2
+    ? snappedPath
+    : (routingError && waypoints.length >= 2 ? waypoints : [])
+  const lineLen = lineLengthMeters(measurePath)
+
+  const lineReady =
+    geometryType === 'line' &&
+    waypoints.length >= 2 &&
+    !routingLoading &&
+    (snappedPath.length >= 2 || routingError)
+  const pointReady = geometryType === 'point' && pointLatLng
+  const geometryReady = lineReady || pointReady
 
   const unusedCaptures = captures.filter(c => !c.used)
 
@@ -81,12 +301,24 @@ export default function ReportPage() {
   const handleSubmit = () => {
     if (!user) { navigate('/profile'); return }
     if (!title || !category) return
+    if (!geometryReady) return
 
     setSubmitting(true)
 
     setTimeout(() => {
-      const issueLat = selectedCapture?.lat || 24.86 + Math.random() * 0.08
-      const issueLng = selectedCapture?.lng || 67.01 + Math.random() * 0.1
+      let issueLat, issueLng, geometry
+      if (geometryType === 'line') {
+        const coords = snappedPath.length >= 2 ? snappedPath : waypoints
+        const mid = coords[Math.floor(coords.length / 2)]
+        issueLat = mid[0]
+        issueLng = mid[1]
+        geometry = { type: 'line', coordinates: coords, waypoints }
+      } else {
+        issueLat = pointLatLng.lat
+        issueLng = pointLatLng.lng
+        geometry = { type: 'point', lat: issueLat, lng: issueLng }
+      }
+
       addIssue({
         title,
         description,
@@ -95,7 +327,7 @@ export default function ReportPage() {
         tags: aiResult?.tags || [category],
         lat: issueLat,
         lng: issueLng,
-        geometry: { type: 'point', lat: issueLat, lng: issueLng },
+        geometry,
         imageUrl: selectedCapture?.photoData || null,
         reporterId: user.id,
         reporterName: anonymous ? 'Anonymous' : user.name,
@@ -253,6 +485,168 @@ export default function ReportPage() {
               </div>
             )}
 
+            {/* Mark affected area */}
+            <div className="mb-5">
+              <label className="font-mono text-[9px] font-semibold uppercase tracking-wider text-txt3 block mb-1.5">
+                Mark affected area
+              </label>
+
+              <div className="flex gap-2 mb-2">
+                <button
+                  onClick={() => setGeometryType('point')}
+                  className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg border font-mono text-[10px] uppercase tracking-wider transition ${
+                    geometryType === 'point'
+                      ? 'bg-lime/10 border-lime/40 text-lime'
+                      : 'bg-surface2 border-border2 text-txt3 hover:text-txt2'
+                  }`}
+                >
+                  <Circle size={12} /> Point
+                </button>
+                <button
+                  onClick={() => setGeometryType('line')}
+                  className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg border font-mono text-[10px] uppercase tracking-wider transition ${
+                    geometryType === 'line'
+                      ? 'bg-mint/10 border-mint/40 text-mint'
+                      : 'bg-surface2 border-border2 text-txt3 hover:text-txt2'
+                  }`}
+                >
+                  <Route size={12} /> Road Stretch
+                </button>
+              </div>
+
+              <p className="font-mono text-[9px] text-txt3 mb-2">
+                {geometryType === 'point'
+                  ? 'Drag the pin to fine-tune the exact location.'
+                  : 'Click along the road — line will snap to streets automatically.'}
+              </p>
+
+              <motion.div
+                animate={shakeControls}
+                className="h-64 rounded-lg overflow-hidden border border-border2 relative"
+              >
+                {pointLatLng && (
+                  <MapContainer
+                    center={mapCenter}
+                    zoom={17}
+                    className="w-full h-full"
+                    zoomControl={true}
+                  >
+                    <TileLayer
+                      url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+                    />
+
+                    <ModeViewController geometryType={geometryType} captureLatLng={captureLatLng} />
+
+                    {geometryType === 'point' && (
+                      <Marker
+                        position={[pointLatLng.lat, pointLatLng.lng]}
+                        icon={pinIcon}
+                        draggable={true}
+                        eventHandlers={{
+                          dragend: (e) => {
+                            const ll = e.target.getLatLng()
+                            setPointLatLng({ lat: ll.lat, lng: ll.lng })
+                          },
+                        }}
+                      />
+                    )}
+
+                    {geometryType === 'line' && (
+                      <>
+                        <LineClickCollector onAdd={handleMapClick} />
+                        {snappedPath.length >= 2 && (
+                          <Polyline
+                            positions={snappedPath}
+                            pathOptions={{
+                              color: '#60f5c0',
+                              weight: 5,
+                              opacity: 0.85,
+                              lineCap: 'round',
+                              lineJoin: 'round',
+                            }}
+                          />
+                        )}
+                        {snappedPath.length < 2 && routingError && waypoints.length >= 2 && (
+                          <Polyline
+                            positions={waypoints}
+                            pathOptions={{
+                              color: '#f5a623',
+                              weight: 4,
+                              opacity: 0.7,
+                              dashArray: '6 8',
+                              lineCap: 'round',
+                            }}
+                          />
+                        )}
+                        {waypoints.map((c, i) => (
+                          <Marker key={i} position={c} icon={waypointIcon} />
+                        ))}
+                      </>
+                    )}
+                  </MapContainer>
+                )}
+
+                {/* Off-road rejection toast */}
+                <AnimatePresence>
+                  {rejectToast && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -10 }}
+                      transition={{ duration: 0.2 }}
+                      className="absolute top-2 left-1/2 -translate-x-1/2 z-[1000] px-3 py-1.5 rounded-md bg-urgent/90 text-white font-mono text-[10px] uppercase tracking-wider shadow-lg pointer-events-none whitespace-nowrap"
+                    >
+                      Not a valid road — click on a street
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.div>
+
+              {geometryType === 'line' && (
+                <div className="mt-2 flex items-center justify-between gap-2">
+                  <div className="flex gap-2">
+                    <button
+                      onClick={undoLastWaypoint}
+                      disabled={waypoints.length === 0}
+                      className="flex items-center gap-1 px-2.5 py-1.5 rounded border border-border2 font-mono text-[9px] uppercase tracking-wider text-txt3 hover:text-txt2 hover:border-mint/40 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <Undo2 size={11} /> Undo
+                    </button>
+                    <button
+                      onClick={clearWaypoints}
+                      disabled={waypoints.length === 0}
+                      className="flex items-center gap-1 px-2.5 py-1.5 rounded border border-border2 font-mono text-[9px] uppercase tracking-wider text-txt3 hover:text-urgent hover:border-urgent/40 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <Trash2 size={11} /> Clear
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-right">
+                    {routingLoading && (
+                      <Loader2 size={11} className="animate-spin text-mint" />
+                    )}
+                    <span className="font-mono text-[10px] text-mint">
+                      {lineLen < 1000 ? `${lineLen.toFixed(0)} m` : `${(lineLen / 1000).toFixed(2)} km`}
+                    </span>
+                    <span className="font-mono text-[9px] text-txt3 ml-1">
+                      {waypoints.length} pt{waypoints.length !== 1 ? 's' : ''}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {geometryType === 'line' && routingError && waypoints.length >= 2 && (
+                <p className="font-mono text-[9px] text-amber mt-1.5">
+                  ⚠ Routing unavailable — using straight lines
+                </p>
+              )}
+
+              {geometryType === 'line' && waypoints.length < 2 && (
+                <p className="font-mono text-[9px] text-amber mt-1.5">
+                  Add at least 2 points to mark the stretch.
+                </p>
+              )}
+            </div>
+
             {/* Form fields */}
             <div className="space-y-4">
               <div>
@@ -337,7 +731,7 @@ export default function ReportPage() {
               {/* Submit */}
               <button
                 onClick={handleSubmit}
-                disabled={!title || !category || submitting}
+                disabled={!title || !category || submitting || !geometryReady}
                 className="w-full flex items-center justify-center gap-2 bg-lime text-bg font-mono text-[11px] font-semibold uppercase tracking-wider py-3 rounded-lg hover:brightness-110 transition disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {submitting ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}

@@ -21,6 +21,24 @@ const SEED_ISSUES = [
     tokensPledged: 890,
     tokensGoal: 1000,
     createdAt: Date.now() - 86400000 * 2,
+    proofs: [
+      {
+        id: 'PRF-001',
+        type: 'image',
+        url: 'https://picsum.photos/seed/manhole1/400/300',
+        addedBy: 'Ahmed K.',
+        addedAt: Date.now() - 86400000 * 2,
+        caption: 'Wide shot showing location at night',
+      },
+      {
+        id: 'PRF-002',
+        type: 'image',
+        url: 'https://picsum.photos/seed/manhole2/400/300',
+        addedBy: 'Rabia N.',
+        addedAt: Date.now() - 86400000 * 1,
+        caption: 'Close-up of the open manhole',
+      },
+    ],
   },
   {
     id: 'ISS-002',
@@ -121,6 +139,16 @@ const SEED_ISSUES = [
     tokensPledged: 620,
     tokensGoal: 1500,
     createdAt: Date.now() - 86400000 * 4,
+    proofs: [
+      {
+        id: 'PRF-003',
+        type: 'image',
+        url: 'https://picsum.photos/seed/road1/400/300',
+        addedBy: 'Bilal R.',
+        addedAt: Date.now() - 86400000 * 4,
+        caption: 'Pothole cluster near Nursery',
+      },
+    ],
   },
   {
     id: 'ISS-007',
@@ -208,6 +236,21 @@ export function IssuesProvider({ children }) {
     return newIssue
   }
 
+  // Append a proof (image or video) to an issue
+  const addProofToIssue = (issueId, proof) => {
+    const fullProof = {
+      id: 'PRF-' + Date.now(),
+      addedAt: Date.now(),
+      ...proof,
+    }
+    setIssues(prev => prev.map(iss => {
+      if (iss.id !== issueId) return iss
+      const existing = iss.proofs || []
+      return { ...iss, proofs: [...existing, fullProof] }
+    }))
+    return fullProof
+  }
+
   // Pledge tokens to an issue
   const pledgeTokens = (issueId, amount) => {
     setIssues(prev => prev.map(iss => {
@@ -236,7 +279,7 @@ export function IssuesProvider({ children }) {
     <IssuesContext.Provider value={{
       issues, captures,
       addCapture, removeCapture, markCaptureUsed,
-      addIssue, pledgeTokens, findNearby,
+      addIssue, pledgeTokens, findNearby, addProofToIssue,
     }}>
       {children}
     </IssuesContext.Provider>
